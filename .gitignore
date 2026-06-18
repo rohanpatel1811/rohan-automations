@@ -6,3 +6,7 @@ node_modules/
 dist/
 .env
 vite.config.js.timestamp*
+node_modules/
+dist/
+.env
+vite.config.js.timestamp*
