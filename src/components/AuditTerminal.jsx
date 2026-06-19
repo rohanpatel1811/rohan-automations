@@ -18,7 +18,14 @@ const buildStreamLines = (domain) => [
   `> computing scores...`,
 ]
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
+// ── PSI constants ─────────────────────────────────────────────────────────────
+const PSI_BASE = 'https://www.googleapis.com/pagespeedonline/v5/runPagespeed'
+const SKIP_TYPES = new Set([
+  'debugdata', 'screenshot', 'filmstrip', 'treemap-data',
+  'criticalrequestchain', 'table',
+])
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
 function normalizeUrl(raw) {
   const s = raw.trim()
   if (!s.startsWith('http://') && !s.startsWith('https://')) return 'https://' + s
@@ -29,7 +36,67 @@ function getDomain(url) {
   try { return new URL(url).hostname } catch { return url }
 }
 
-// ── Component ────────────────────────────────────────────────────────────────
+/** Call PSI directly from the browser — no server timeout. */
+async function runPSI(url) {
+  const psiUrl =
+    PSI_BASE +
+    `?url=${encodeURIComponent(url)}` +
+    '&strategy=mobile' +
+    '&category=performance' +
+    '&category=seo' +
+    '&category=accessibility' +
+    '&category=best-practices'
+
+  const res  = await fetch(psiUrl)
+  const body = await res.json()
+
+  if (!res.ok) {
+    const msg = (body?.error?.message || `pagespeed returned ${res.status}`).toLowerCase()
+    throw Object.assign(new Error(msg), { psiError: true })
+  }
+
+  const lhr = body.lighthouseResult
+  if (!lhr) {
+    throw Object.assign(
+      new Error('pagespeed ran but returned no lighthouse data. the site may have blocked the crawl.'),
+      { psiError: true }
+    )
+  }
+
+  // Scores 0–100
+  const cats = lhr.categories || {}
+  const scores = {
+    performance:   Math.round((cats.performance?.score       ?? 0) * 100),
+    seo:           Math.round((cats.seo?.score               ?? 0) * 100),
+    accessibility: Math.round((cats.accessibility?.score     ?? 0) * 100),
+    bestPractices: Math.round((cats['best-practices']?.score ?? 0) * 100),
+  }
+
+  // Top 3 failing audits with human-readable values
+  const issues = Object.values(lhr.audits || {})
+    .filter(a => {
+      if (a.score === null || a.score === 1 || a.score >= 0.9) return false
+      if (!a.displayValue) return false
+      if (SKIP_TYPES.has(a.details?.type)) return false
+      return true
+    })
+    .sort((a, b) => (a.score ?? 0) - (b.score ?? 0))
+    .slice(0, 3)
+    .map(a => ({ title: a.title ?? '', displayValue: a.displayValue ?? '' }))
+
+  return { scores, issues }
+}
+
+/** Fire-and-forget — log scores to Sheets via /api/log (never blocks the UI). */
+function logToSheets(url, scores) {
+  fetch('/api/log', {
+    method:  'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body:    JSON.stringify({ url, ...scores }),
+  }).catch(() => {})
+}
+
+// ── Component ─────────────────────────────────────────────────────────────────
 export default function AuditTerminal() {
   const [urlInput, setUrlInput]       = useState('')
   const [status, setStatus]           = useState('idle') // idle | loading | done | error
@@ -53,7 +120,7 @@ export default function AuditTerminal() {
     }
   }, [lines])
 
-  // ── Reset ─────────────────────────────────────────────────────────────────
+  // ── Reset ──────────────────────────────────────────────────────────────────
   function reset() {
     clearInterval(intervalRef.current)
     setStatus('idle')
@@ -61,13 +128,13 @@ export default function AuditTerminal() {
     setResult(null)
     setErrorLine('')
     setShowBooking(false)
-    resolvedData.current  = null
-    lineIndexRef.current  = 0
-    streamLines.current   = []
+    resolvedData.current = null
+    lineIndexRef.current = 0
+    streamLines.current  = []
     setTimeout(() => inputEl.current?.focus(), 60)
   }
 
-  // ── Finish (after both stream complete + data ready) ──────────────────────
+  // ── Finish (after both stream complete + data ready) ───────────────────────
   function finish(data) {
     setLines(prev => [...prev, '> done.'])
     setTimeout(() => {
@@ -76,7 +143,7 @@ export default function AuditTerminal() {
     }, 650)
   }
 
-  // ── Submit ────────────────────────────────────────────────────────────────
+  // ── Submit ─────────────────────────────────────────────────────────────────
   async function handleSubmit(e) {
     if (e) e.preventDefault()
     const raw = urlInput.trim()
@@ -85,14 +152,14 @@ export default function AuditTerminal() {
     const full   = normalizeUrl(raw)
     const domain = getDomain(full)
 
-    // Validate URL shape client-side (real validation also in API)
+    // Client-side URL shape validation
     try { new URL(full) } catch {
       setStatus('error')
       setErrorLine(`> "${raw}" doesn't look like a valid url. try yoursite.com`)
       return
     }
 
-    // ── Reset state for new run ─────────────────────────────────────────────
+    // Reset state for new run
     clearInterval(intervalRef.current)
     setStatus('loading')
     setLines([])
@@ -103,9 +170,9 @@ export default function AuditTerminal() {
     lineIndexRef.current = 0
     streamLines.current  = buildStreamLines(domain)
 
-    // ── Stream lines while we wait for the real fetch ──────────────────────
+    // Stream lines while PSI is running (browser fetch — no 10s cap)
     intervalRef.current = setInterval(() => {
-      const i = lineIndexRef.current
+      const i   = lineIndexRef.current
       const all = streamLines.current
 
       if (i < all.length) {
@@ -114,48 +181,43 @@ export default function AuditTerminal() {
       } else {
         // All lines shown — if data already resolved, finish now
         clearInterval(intervalRef.current)
-        if (resolvedData.current) {
-          finish(resolvedData.current)
-        }
-        // else: fetch resolve handler will call finish()
+        if (resolvedData.current) finish(resolvedData.current)
+        // else: PSI resolve handler calls finish()
       }
     }, 1100)
 
-    // ── Real fetch ────────────────────────────────────────────────────────
+    // Call PSI directly from the browser — Vercel timeout doesn't apply
     try {
-      const res  = await fetch(`/api/audit?url=${encodeURIComponent(full)}`)
-      const data = await res.json()
+      const data = await runPSI(full)
 
-      if (data.error) {
-        // API returned a clean error shape — show it in terminal voice
-        clearInterval(intervalRef.current)
-        setStatus('error')
-        setErrorLine(`> ${data.message}`)
-        return
-      }
+      // Log to Sheets in the background (never blocks UI)
+      logToSheets(full, data.scores)
 
-      // Data ready — check if streaming has finished
+      // Race resolution: check if stream has finished already
       resolvedData.current = data
       if (lineIndexRef.current >= streamLines.current.length) {
-        // Stream already done; finish immediately
         clearInterval(intervalRef.current)
         finish(data)
       }
-      // else: interval will call finish() when the last line fires
-    } catch {
+      // else: interval fires finish() when the last line completes
+    } catch (err) {
       clearInterval(intervalRef.current)
       setStatus('error')
-      setErrorLine(`> network error reaching the audit server. check your connection and retry.`)
+      setErrorLine(
+        err.psiError
+          ? `> ${err.message}`
+          : '> network error reaching pagespeed insights. check your connection and retry.'
+      )
     }
   }
 
-  // ── Render ────────────────────────────────────────────────────────────────
-  const isRunning = status === 'loading'
+  // ── Render ─────────────────────────────────────────────────────────────────
+  const isRunning    = status === 'loading'
   const showTerminal = status === 'loading' || status === 'done' || status === 'error'
 
   return (
     <div className="audit-terminal">
-      {/* ── URL Input ──────────────────────────────────────────────────────── */}
+      {/* URL Input */}
       <form onSubmit={handleSubmit} aria-label="Site audit">
         <div className="audit-input-group">
           <span className="audit-prompt" aria-hidden="true">$</span>
@@ -187,7 +249,7 @@ export default function AuditTerminal() {
         </div>
       </form>
 
-      {/* ── Terminal output ─────────────────────────────────────────────────── */}
+      {/* Terminal output */}
       <AnimatePresence>
         {showTerminal && (
           <motion.div
@@ -236,7 +298,7 @@ export default function AuditTerminal() {
         )}
       </AnimatePresence>
 
-      {/* ── Score reveal + booking ──────────────────────────────────────────── */}
+      {/* Score reveal + booking */}
       <AnimatePresence>
         {status === 'done' && result && (
           <motion.div
