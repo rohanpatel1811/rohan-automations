@@ -1,4 +1,4 @@
-/ Vercel serverless function — Node.js 20 (native fetch, no deps)
+// Vercel serverless function — Node.js 20 (native fetch, no deps)
 // Called by the frontend: GET /api/audit?url=https://example.com
 
 export default async function handler(req, res) {
