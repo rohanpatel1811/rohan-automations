@@ -38,6 +38,7 @@ function getDomain(url) {
 
 /** Call PSI directly from the browser — no server timeout. */
 async function runPSI(url) {
+  const apiKey = import.meta.env.VITE_PSI_API_KEY || ''
   const psiUrl =
     PSI_BASE +
     `?url=${encodeURIComponent(url)}` +
@@ -45,7 +46,8 @@ async function runPSI(url) {
     '&category=performance' +
     '&category=seo' +
     '&category=accessibility' +
-    '&category=best-practices'
+    '&category=best-practices' +
+    (apiKey ? `&key=${apiKey}` : '')
 
   const res  = await fetch(psiUrl)
   const body = await res.json()
